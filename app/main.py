@@ -13,6 +13,8 @@ from .schemas import (
     AuditCreate,
     AuditListItem,
     AuditOut,
+    DnssecRolloverCheckCreate,
+    DnssecRolloverCheckOut,
     IxfrReplayConflictResponse,
     IxfrReplayCreate,
     IxfrReplayOut,
@@ -36,6 +38,7 @@ from .schemas import (
 )
 from .repair import build_repair_plan
 from .release_plan import ReleasePlanError, build_release_plan
+from .rollover import check_zsk_rollover
 from .service import analyze
 from .snapshot import SnapshotConsistencyError, check_snapshot_consistency
 from .suggest import SuggestionError, suggest_next_serial
@@ -480,6 +483,45 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "每个 delta 内先删除再新增，任一操作冲突则该 delta 整体作废"
         )
         return result
+
+    @app.post(
+        "/api/zones/{zone}/dnssec-rollover-checks",
+        response_model=DnssecRolloverCheckOut,
+        responses={
+            422: {
+                "description": (
+                    "四个关键时刻未严格递增，或 TTL/时钟偏差/时间格式等"
+                    "请求体字段校验失败"
+                ),
+            }
+        },
+    )
+    def create_dnssec_rollover_check(
+        zone: str, payload: DnssecRolloverCheckCreate
+    ) -> dict:
+        """ZSK 双签轮换时序校验（仅计算，不写库）。
+
+        提交双签轮换的四个关键时刻（UTC，须严格递增：新钥发布 < 新钥启签
+        < 旧钥停签 < 旧钥移除，否则 422）、DNSKEY TTL、区记录最大 TTL 与
+        允许时钟偏差，校验两处最短等待：
+
+        - 新钥发布 → 启签：至少等待 ``DNSKEY TTL + 时钟偏差`` 秒；
+        - 旧钥停签 → 移除：至少等待 ``区记录最大 TTL + 时钟偏差`` 秒。
+
+        响应给出 safe、两阶段的实际/要求秒数与终点事件最早安全时间；
+        等待不足仍返回 200，violations 按阶段顺序列出不足明细。
+        """
+        zone_name = _normalize_zone(zone)
+        return check_zsk_rollover(
+            zone_name,
+            payload.new_key_published_at,
+            payload.new_key_activated_at,
+            payload.old_key_deactivated_at,
+            payload.old_key_removed_at,
+            payload.dnskey_ttl,
+            payload.max_zone_ttl,
+            payload.clock_skew_seconds,
+        )
 
     return app
 

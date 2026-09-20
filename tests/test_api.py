@@ -2193,6 +2193,182 @@ def test_ixfr_replay_invalid_body_422(client, payload):
     assert resp.status_code == 422
 
 
+# ---------- ZSK 双签轮换时序校验 ----------
+
+
+def _rollover_payload(**overrides):
+    payload = {
+        "new_key_published_at": "2026-09-20T00:00:00Z",
+        "new_key_activated_at": "2026-09-20T02:00:00Z",
+        "old_key_deactivated_at": "2026-09-21T00:00:00Z",
+        "old_key_removed_at": "2026-09-21T03:00:00Z",
+        "dnskey_ttl": 3600,
+        "max_zone_ttl": 7200,
+        "clock_skew_seconds": 300,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_dnssec_rollover_safe(client):
+    resp = client.post(
+        "/api/zones/example.com/dnssec-rollover-checks", json=_rollover_payload()
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["zone"] == "example.com"
+    assert body["safe"] is True
+    assert body["dnskey_ttl"] == 3600
+    assert body["max_zone_ttl"] == 7200
+    assert body["clock_skew_seconds"] == 300
+    assert body["violations"] == []
+    assert body["phases"] == [
+        {
+            "phase": "publish_to_activate",
+            "from_at": "2026-09-20T00:00:00Z",
+            "to_at": "2026-09-20T02:00:00Z",
+            "actual_seconds": 7200,
+            "required_seconds": 3900,   # 3600 + 300
+            "earliest_safe_at": "2026-09-20T01:05:00Z",
+            "ok": True,
+        },
+        {
+            "phase": "deactivate_to_remove",
+            "from_at": "2026-09-21T00:00:00Z",
+            "to_at": "2026-09-21T03:00:00Z",
+            "actual_seconds": 10800,
+            "required_seconds": 7500,   # 7200 + 300
+            "earliest_safe_at": "2026-09-21T02:05:00Z",
+            "ok": True,
+        },
+    ]
+
+
+def test_dnssec_rollover_exactly_required_wait_is_safe(client):
+    # 恰好等待 required_seconds（边界取等）即安全
+    payload = _rollover_payload(
+        new_key_activated_at="2026-09-20T01:05:00Z",   # 恰好 3900 秒
+        old_key_removed_at="2026-09-21T02:05:00Z",     # 恰好 7500 秒
+    )
+    resp = client.post("/api/zones/example.com/dnssec-rollover-checks", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["safe"] is True
+    assert [phase["ok"] for phase in body["phases"]] == [True, True]
+    assert body["violations"] == []
+
+
+def test_dnssec_rollover_insufficient_wait_still_200(client):
+    # 停签 → 移除仅 3600 秒，不足要求的 7500 秒：仍返回 200 并列出违规
+    payload = _rollover_payload(old_key_removed_at="2026-09-21T01:00:00Z")
+    resp = client.post("/api/zones/example.com/dnssec-rollover-checks", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["safe"] is False
+    assert [phase["ok"] for phase in body["phases"]] == [True, False]
+    assert body["violations"] == [
+        {
+            "phase": "deactivate_to_remove",
+            "actual_seconds": 3600,
+            "required_seconds": 7500,
+            "shortfall_seconds": 3900,
+            "earliest_safe_at": "2026-09-21T02:05:00Z",
+            "message": body["violations"][0]["message"],
+        }
+    ]
+    assert "7500" in body["violations"][0]["message"]
+
+
+def test_dnssec_rollover_violations_in_phase_order(client):
+    # 两个阶段都不足时，violations 按阶段顺序（发布→启签 在前）
+    payload = _rollover_payload(
+        new_key_activated_at="2026-09-20T00:30:00Z",   # 1800 < 3900
+        old_key_removed_at="2026-09-21T01:00:00Z",     # 3600 < 7500
+    )
+    resp = client.post("/api/zones/example.com/dnssec-rollover-checks", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["safe"] is False
+    assert [v["phase"] for v in body["violations"]] == [
+        "publish_to_activate",
+        "deactivate_to_remove",
+    ]
+    assert body["violations"][0]["shortfall_seconds"] == 2100
+    assert body["violations"][0]["earliest_safe_at"] == "2026-09-20T01:05:00Z"
+
+
+def test_dnssec_rollover_zero_skew_and_ttl(client):
+    # TTL 与时钟偏差均可为 0：任何严格递增的时间都安全
+    payload = _rollover_payload(
+        new_key_activated_at="2026-09-20T00:00:01Z",
+        old_key_deactivated_at="2026-09-20T00:00:02Z",
+        old_key_removed_at="2026-09-20T00:00:03Z",
+        dnskey_ttl=0,
+        max_zone_ttl=0,
+        clock_skew_seconds=0,
+    )
+    resp = client.post("/api/zones/example.com/dnssec-rollover-checks", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["safe"] is True
+    assert body["phases"][0]["required_seconds"] == 0
+    assert body["phases"][1]["required_seconds"] == 0
+
+
+def test_dnssec_rollover_timezone_and_naive_datetimes(client):
+    # 带偏移的时间转换为 UTC；不带时区的按 UTC 处理
+    payload = _rollover_payload(
+        new_key_published_at="2026-09-20T08:00:00+08:00",  # 即 2026-09-20T00:00:00Z
+        new_key_activated_at="2026-09-20T02:00:00",        # 朴素时间按 UTC
+    )
+    resp = client.post("/api/zones/example.com/dnssec-rollover-checks", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["phases"][0]["from_at"] == "2026-09-20T00:00:00Z"
+    assert body["phases"][0]["actual_seconds"] == 7200
+
+
+def test_dnssec_rollover_not_persisted(client):
+    resp = client.post(
+        "/api/zones/example.com/dnssec-rollover-checks", json=_rollover_payload()
+    )
+    assert resp.status_code == 200
+    assert client.get("/api/audits").json() == []
+    assert client.get("/api/zones/example.com/serial-reservations").json() == []
+
+
+def test_dnssec_rollover_invalid_zone_400(client):
+    resp = client.post(
+        "/api/zones/bad_zone!/dnssec-rollover-checks", json=_rollover_payload()
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # 四个时刻未严格递增：相等
+        _rollover_payload(new_key_activated_at="2026-09-20T00:00:00Z"),
+        # 四个时刻未严格递增：倒退
+        _rollover_payload(old_key_deactivated_at="2026-09-19T00:00:00Z"),
+        _rollover_payload(old_key_removed_at="2026-09-21T00:00:00Z"),
+        _rollover_payload(dnskey_ttl=-1),                       # TTL 下越界
+        _rollover_payload(dnskey_ttl=2**31),                    # TTL 上越界
+        _rollover_payload(max_zone_ttl=-1),
+        _rollover_payload(max_zone_ttl=2**31),
+        _rollover_payload(clock_skew_seconds=-1),               # 时钟偏差为负
+        _rollover_payload(clock_skew_seconds=2**31),
+        _rollover_payload(new_key_published_at="not-a-time"),   # 时间格式非法
+        {"dnskey_ttl": 3600, "max_zone_ttl": 7200,
+         "clock_skew_seconds": 300},                            # 缺四个时刻
+        "not-an-object",                                        # 请求体非对象
+    ],
+)
+def test_dnssec_rollover_invalid_body_422(client, payload):
+    resp = client.post("/api/zones/example.com/dnssec-rollover-checks", json=payload)
+    assert resp.status_code == 422
+
+
 # ---------- 并发：串行化分配，不重复 serial ----------
 
 def test_concurrent_reservations_no_duplicate_serials(tmp_path):

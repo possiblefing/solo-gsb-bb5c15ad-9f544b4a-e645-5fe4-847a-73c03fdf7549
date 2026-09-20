@@ -13,6 +13,7 @@
 - 提供 **多源观测 serial 时间线重建**（`POST /api/zones/{zone}/serial-timelines`，仅计算不写库）：接收多个采集源（collector）在不同时刻上报的 SOA serial，按 `bucket_seconds` 做时间桶聚合，桶内同一采集源只取 `observed_at` 最新观测（最新时刻出现不同 serial 返回 **422**）；再用动态规划从各桶候选值中选出一条相邻桶只含 RFC 1982 相等或有效前进关系的时间线，目标依次为最大化采集源支持数、最少跳变、完全并列按整条 serial 序列字典序升序；倒退与不可比较一律禁止，首个无法延续的桶返回 **409** 并给出冲突位置与最优前缀。
 - 提供 **权威快照一致性检查**（`POST /api/zones/{zone}/snapshot-consistency`，仅检查不写库）：接收多个权威节点的 RRset 快照（owner、type、class、ttl、rdata）与最小同意节点数 `min_agreeing`，将属主名规范化为小写无尾点、类型与类大写、rdata 去重排序后，按 RRset 统计各取值（含"缺席"）的同意节点数，取**唯一最高票**且达到门槛的值为共识；返回可发布的共识快照、逐节点差异（mismatch/missing/extra）与冲突 RRset；任一 RRset 最高票未达门槛或达到门槛但并列时返回 **409** 并列出各取值的投票分布。
 - 提供 **IXFR 增量回放预演**（`POST /api/zones/{zone}/ixfr-replays`，仅预演不写库）：提交起始 serial、初始 RRset 集合与有序 delta 列表，校验 serial 链（每个 delta 的 `from_serial` 必须等于当前 serial、`to_serial` 必须为 RFC 1982 有效前进），RR 规范化后以 `(owner, type, class, ttl, rdata)` 五元组为同一性判据，单个 delta 内**先删除再新增**；删除不存在的 RR 或新增已存在的 RR 时返回 **409** 并给出 delta 下标、失败操作与该 delta 前的完整快照（该 delta 原子作废，不留半步修改）；成功时返回最终 serial、规范化快照与每步增删计数。
+- 提供 **ZSK 双签轮换时序校验**（`POST /api/zones/{zone}/dnssec-rollover-checks`，仅校验不写库）：提交新钥发布/启签、旧钥停签/移除四个 UTC 时刻（须严格递增，否则 **422**）与 DNSKEY TTL、区记录最大 TTL、允许时钟偏差，校验"发布 → 启签至少等待 `DNSKEY TTL + 时钟偏差`、停签 → 移除至少等待 `区记录最大 TTL + 时钟偏差`"；返回 `safe`、两阶段实际/要求秒数与最早安全时间，等待不足仍返回 **200** 并按阶段顺序列出 `violations`。
 
 ## 快速启动（单条命令）
 
@@ -51,6 +52,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/api/zones/{zone}/serial-timelines` | 多源观测 serial 时间线重建，不写库（200；桶内最新观测冲突 422；无法延续 409） |
 | `POST` | `/api/zones/{zone}/snapshot-consistency` | 权威快照一致性检查，不写库（200；任一 RRset 未达成唯一多数共识返回 409） |
 | `POST` | `/api/zones/{zone}/ixfr-replays` | IXFR 增量回放预演，不写库（200；删除不存在/新增已存在的 RR 返回 409；serial 链非法返回 422） |
+| `POST` | `/api/zones/{zone}/dnssec-rollover-checks` | ZSK 双签轮换时序校验，不写库（200，等待不足仍返回 200 并列出 violations；四个时刻未严格递增返回 422） |
 | `GET` | `/health` | 健康检查 |
 
 ### 提交审计
@@ -651,6 +653,86 @@ curl -s -X POST http://localhost:8000/api/zones/example.com/ixfr-replays \
 
 - 初始 RRset 键重复、`serial` 越界、`ttl` 越界、属主/类型/类非法、`rdata` 空白、`deltas` 为空等请求问题返回 **422**；路径中区域名非法返回 **400**。
 
+### ZSK 双签轮换时序校验
+
+`POST /api/zones/{zone}/dnssec-rollover-checks` 用于 DNSSEC **双签（double-signature）ZSK 轮换**的时序核对：提交轮换计划的四个关键时刻与相关 TTL/时钟偏差，服务端校验两处最短等待是否满足。结果**仅即时计算，不写入数据库**（不会产生审计或预留记录）。
+
+请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `new_key_published_at` | 新 ZSK 发布时刻（ISO 8601；不带时区偏移时按 UTC 处理） |
+| `new_key_activated_at` | 新 ZSK 启签时刻（开始使用新钥签名，新旧签名并存） |
+| `old_key_deactivated_at` | 旧 ZSK 停签时刻（停止使用旧钥签名） |
+| `old_key_removed_at` | 旧 ZSK 移除时刻（从 DNSKEY RRset 中移除） |
+| `dnskey_ttl` | DNSKEY RRset 的 TTL（秒，`0..2147483647`） |
+| `max_zone_ttl` | 区内记录的最大 TTL（秒，`0..2147483647`） |
+| `clock_skew_seconds` | 允许的时钟偏差（秒，`0..2147483647`），在两处最短等待之上追加 |
+
+校验规则：
+
+- 四个时刻必须**严格递增**（发布 < 启签 < 停签 < 移除），否则返回 **422**；
+- **发布 → 启签**至少等待 `dnskey_ttl + clock_skew_seconds` 秒（保证含新钥的 DNSKEY RRset 已传播到所有缓存）；
+- **停签 → 移除**至少等待 `max_zone_ttl + clock_skew_seconds` 秒（保证缓存中由旧钥签名的区记录全部过期）；
+- 等待不足**不视为请求错误**：仍返回 **200**，`safe` 为 `false`，`violations` 按阶段顺序列出不足明细。
+
+```bash
+curl -s -X POST http://localhost:8000/api/zones/example.com/dnssec-rollover-checks \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "new_key_published_at": "2026-09-20T00:00:00Z",
+        "new_key_activated_at": "2026-09-20T02:00:00Z",
+        "old_key_deactivated_at": "2026-09-21T00:00:00Z",
+        "old_key_removed_at": "2026-09-21T03:00:00Z",
+        "dnskey_ttl": 3600,
+        "max_zone_ttl": 7200,
+        "clock_skew_seconds": 300
+      }'
+```
+
+```json
+{
+  "zone": "example.com",
+  "safe": true,
+  "dnskey_ttl": 3600,
+  "max_zone_ttl": 7200,
+  "clock_skew_seconds": 300,
+  "phases": [
+    {"phase": "publish_to_activate",
+     "from_at": "2026-09-20T00:00:00Z", "to_at": "2026-09-20T02:00:00Z",
+     "actual_seconds": 7200, "required_seconds": 3900,
+     "earliest_safe_at": "2026-09-20T01:05:00Z", "ok": true},
+    {"phase": "deactivate_to_remove",
+     "from_at": "2026-09-21T00:00:00Z", "to_at": "2026-09-21T03:00:00Z",
+     "actual_seconds": 10800, "required_seconds": 7500,
+     "earliest_safe_at": "2026-09-21T02:05:00Z", "ok": true}
+  ],
+  "violations": [],
+  "note": "轮换时序校验仅依据本次请求即时计算，不写入数据库；新钥发布 → 启签至少等待 DNSKEY TTL + 时钟偏差，旧钥停签 → 移除至少等待区记录最大 TTL + 时钟偏差"
+}
+```
+
+- `phases[]` 固定按"发布 → 启签"（`publish_to_activate`）、"停签 → 移除"（`deactivate_to_remove`）顺序给出两阶段明细：`actual_seconds`（实际等待秒数）、`required_seconds`（要求的最短等待，即 TTL + 时钟偏差）、`earliest_safe_at`（终点事件的最早安全时间 = 阶段起点 + `required_seconds`）与 `ok`；等待恰好等于要求值（边界取等）即视为安全；
+- **等待不足（仍为 200）**：`safe` 为 `false`，`violations` 按阶段顺序列出每个不足阶段的 `actual_seconds`/`required_seconds`/`shortfall_seconds`（不足秒数）/`earliest_safe_at` 与说明信息。下例停签 → 移除仅等待 3600 秒，不足要求的 7500 秒：
+
+```json
+{
+  "zone": "example.com",
+  "safe": false,
+  "phases": [ {"phase": "publish_to_activate", "ok": true, "...": "..."},
+              {"phase": "deactivate_to_remove", "ok": false, "...": "..."} ],
+  "violations": [
+    {"phase": "deactivate_to_remove",
+     "actual_seconds": 3600, "required_seconds": 7500, "shortfall_seconds": 3900,
+     "earliest_safe_at": "2026-09-21T02:05:00Z",
+     "message": "阶段旧钥停签 → 移除实际等待 3600 秒，不足要求的 7500 秒（还差 3900 秒），终点事件最早安全时间为 2026-09-21T02:05:00Z"}
+  ],
+  "note": "..."
+}
+```
+
+- 四个时刻未严格递增（相等或倒退）、TTL/时钟偏差越界或为负、时间格式非法、缺少字段等请求问题返回 **422**；路径中区域名非法返回 **400**。
+
 ## 判定规则（RFC 1982）
 
 serial 是模 `2^32` 环形空间上的值。设前向距离 `d = (current - previous) mod 2^32`：
@@ -690,6 +772,7 @@ app/
   timeline.py  # 多源观测 serial 时间线重建（不落库）
   snapshot.py  # 权威快照一致性检查（不落库）
   ixfr.py      # IXFR 增量回放预演（不落库）
+  rollover.py    # ZSK 双签轮换时序校验（不落库）
   service.py   # 逐项判定与汇总
   db.py        # SQLite 持久层（审计记录 + serial 预留的事务化分配与查询）
   schemas.py   # 请求/响应模型与校验

@@ -1018,3 +1018,123 @@ class IxfrReplayConflictResponse(BaseModel):
     """RR 操作冲突时 409 响应体（HTTPException 的标准 detail 包装）。"""
 
     detail: IxfrReplayConflictDetail
+
+
+# ---------- ZSK 双签轮换时序校验 ----------
+
+
+def _as_utc(value: datetime) -> datetime:
+    """归一化为 UTC：带时区的做转换，朴素时间戳按 UTC 处理。"""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+class DnssecRolloverCheckCreate(BaseModel):
+    """ZSK 双签轮换时序校验请求（仅计算，不写库）。"""
+
+    new_key_published_at: datetime = Field(
+        description="新 ZSK 发布时刻（ISO 8601；不带时区偏移时按 UTC 处理）",
+        examples=["2026-09-20T00:00:00Z"],
+    )
+    new_key_activated_at: datetime = Field(
+        description="新 ZSK 启签时刻（ISO 8601；不带时区偏移时按 UTC 处理）",
+        examples=["2026-09-20T02:00:00Z"],
+    )
+    old_key_deactivated_at: datetime = Field(
+        description="旧 ZSK 停签时刻（ISO 8601；不带时区偏移时按 UTC 处理）",
+        examples=["2026-09-21T00:00:00Z"],
+    )
+    old_key_removed_at: datetime = Field(
+        description="旧 ZSK 移除时刻（ISO 8601；不带时区偏移时按 UTC 处理）",
+        examples=["2026-09-21T03:00:00Z"],
+    )
+    dnskey_ttl: int = Field(
+        ge=0,
+        le=2**31 - 1,
+        description="DNSKEY RRset 的 TTL（秒，RFC 2181 的 31 位非负整数）",
+        examples=[3600],
+    )
+    max_zone_ttl: int = Field(
+        ge=0,
+        le=2**31 - 1,
+        description="区内记录的最大 TTL（秒，RFC 2181 的 31 位非负整数）",
+        examples=[7200],
+    )
+    clock_skew_seconds: int = Field(
+        ge=0,
+        le=2**31 - 1,
+        description="允许的时钟偏差（秒），在两处最短等待之上追加",
+        examples=[300],
+    )
+
+    @field_validator(
+        "new_key_published_at",
+        "new_key_activated_at",
+        "old_key_deactivated_at",
+        "old_key_removed_at",
+    )
+    @classmethod
+    def _normalize_utc(cls, value: datetime) -> datetime:
+        return _as_utc(value)
+
+    @model_validator(mode="after")
+    def _check_strictly_increasing(self) -> "DnssecRolloverCheckCreate":
+        moments = [
+            ("new_key_published_at", self.new_key_published_at),
+            ("new_key_activated_at", self.new_key_activated_at),
+            ("old_key_deactivated_at", self.old_key_deactivated_at),
+            ("old_key_removed_at", self.old_key_removed_at),
+        ]
+        for (prev_name, prev), (cur_name, cur) in zip(moments, moments[1:]):
+            if cur <= prev:
+                raise ValueError(
+                    "四个关键时刻必须严格递增："
+                    f"{cur_name}（{cur.isoformat()}）必须晚于 "
+                    f"{prev_name}（{prev.isoformat()}）"
+                )
+        return self
+
+
+class RolloverPhaseCheck(BaseModel):
+    """单个等待阶段的校验结果。"""
+
+    phase: Literal["publish_to_activate", "deactivate_to_remove"] = Field(
+        description="阶段标识：publish_to_activate=新钥发布→启签；deactivate_to_remove=旧钥停签→移除"
+    )
+    from_at: str = Field(description="阶段起点事件时间（UTC ISO 8601，含时区 Z）")
+    to_at: str = Field(description="阶段终点事件时间（UTC ISO 8601，含时区 Z）")
+    actual_seconds: int = Field(ge=0, description="实际等待秒数")
+    required_seconds: int = Field(ge=0, description="要求的最短等待秒数（TTL + 时钟偏差）")
+    earliest_safe_at: str = Field(
+        description="终点事件的最早安全时间（起点 + required_seconds，UTC ISO 8601）"
+    )
+    ok: bool = Field(description="实际等待是否达到要求")
+
+
+class RolloverViolation(BaseModel):
+    """等待不足的阶段违规描述。"""
+
+    phase: Literal["publish_to_activate", "deactivate_to_remove"]
+    actual_seconds: int = Field(ge=0, description="实际等待秒数")
+    required_seconds: int = Field(ge=0, description="要求的最短等待秒数")
+    shortfall_seconds: int = Field(ge=1, description="不足的秒数（required - actual）")
+    earliest_safe_at: str = Field(description="终点事件的最早安全时间（UTC ISO 8601）")
+    message: str
+
+
+class DnssecRolloverCheckOut(BaseModel):
+    """ZSK 双签轮换时序校验（200）响应体；等待不足时同样返回 200。"""
+
+    zone: str
+    safe: bool = Field(description="两个阶段的等待均达到要求时为 true")
+    dnskey_ttl: int = Field(description="请求中的 DNSKEY RRset TTL（秒）")
+    max_zone_ttl: int = Field(description="请求中的区记录最大 TTL（秒）")
+    clock_skew_seconds: int = Field(description="请求中的允许时钟偏差（秒）")
+    phases: list[RolloverPhaseCheck] = Field(
+        description="两个等待阶段的明细（固定按发布→启签、停签→移除顺序）"
+    )
+    violations: list[RolloverViolation] = Field(
+        description="等待不足的阶段（按阶段顺序；safe 为 true 时为空）"
+    )
+    note: str
