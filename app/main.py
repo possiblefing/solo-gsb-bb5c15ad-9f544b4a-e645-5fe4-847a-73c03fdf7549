@@ -7,12 +7,15 @@ from datetime import date, datetime, timezone
 from fastapi import FastAPI, HTTPException, Query, Response
 
 from . import db
+from .dnssec import check_dnssec_rollover
 from .ixfr import IxfrReplayError, run_ixfr_replay
 from .rfc1982 import MAX_SERIAL
 from .schemas import (
     AuditCreate,
     AuditListItem,
     AuditOut,
+    DnssecRolloverCheckCreate,
+    DnssecRolloverCheckOut,
     IxfrReplayConflictResponse,
     IxfrReplayCreate,
     IxfrReplayOut,
@@ -480,6 +483,42 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "每个 delta 内先删除再新增，任一操作冲突则该 delta 整体作废"
         )
         return result
+
+    @app.post(
+        "/api/zones/{zone}/dnssec-rollover-checks",
+        response_model=DnssecRolloverCheckOut,
+        responses={
+            422: {
+                "description": (
+                    "四个时间未严格递增（新钥发布 < 新钥启签 < 旧钥停签 < 旧钥移除）；"
+                    "其余请求体字段校验失败同样返回 422"
+                ),
+            },
+        },
+    )
+    def create_dnssec_rollover_check(
+        zone: str, payload: DnssecRolloverCheckCreate
+    ) -> dict:
+        """ZSK 双签（double-signature）轮换时序校验（仅校验，不写库）。
+
+        校验一次轮换计划的两个等待阶段：新钥**发布到启签**至少等待
+        ``DNSKEY TTL + 时钟偏差``（保证缓存中不含新钥的旧 DNSKEY RRset
+        全部过期），旧钥**停签到移除**至少等待 ``区记录最大 TTL + 时钟偏差``
+        （保证缓存中由旧钥生成的签名全部过期）。四个时间必须严格递增，
+        否则返回 422。等待时间不足时仍返回 200，``safe`` 为 false，
+        ``violations`` 按阶段顺序列出不足的阶段与最早安全时间。
+        """
+        zone_name = _normalize_zone(zone)
+        return check_dnssec_rollover(
+            zone_name,
+            payload.new_key_published_at,
+            payload.new_key_activated_at,
+            payload.old_key_deactivated_at,
+            payload.old_key_removed_at,
+            payload.dnskey_ttl,
+            payload.max_zone_ttl,
+            payload.clock_skew,
+        )
 
     return app
 
